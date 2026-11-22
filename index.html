@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Outage Radar</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Official Telegram Mini App SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+    #map { height: 100vh; width: 100vw; }
+    .controls {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      z-index: 1000; display: flex; gap: 8px; background: rgba(20, 20, 20, 0.92);
+      padding: 12px 14px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      width: max-content; max-width: 95vw;
+    }
+    button {
+      border: none; padding: 10px 12px; border-radius: 10px; font-weight: 600;
+      color: white; cursor: pointer; font-size: 13px; transition: opacity 0.2s;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-elec { background: #eab308; color: #111; }
+    .btn-water { background: #3b82f6; }
+    .btn-wifi { background: #a855f7; }
+    .filter-bar {
+      position: fixed; top: 15px; left: 50%; transform: translateX(-50%);
+      z-index: 1000; background: white; padding: 6px 14px; border-radius: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2); display: flex; gap: 8px; font-size: 13px;
+      align-items: center;
+    }
+    .filter-bar select { border: none; font-weight: bold; outline: none; background: transparent; }
+    .banner {
+      position: fixed; top: 55px; left: 50%; transform: translateX(-50%);
+      z-index: 1000; background: #dc2626; color: white; padding: 8px 14px;
+      border-radius: 12px; font-size: 12px; text-align: center; display: none;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.3); width: 90vw; max-width: 380px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="filter-bar">
+    <span>Show:</span>
+    <select id="filterType" onchange="loadOutages()">
+      <option value="all">All Outages (24h)</option>
+      <option value="electricity">Electricity Only</option>
+      <option value="water">Water Only</option>
+      <option value="wifi">Wi-Fi Only</option>
+    </select>
+  </div>
+
+  <div id="tgWarning" class="banner"></div>
+
+  <div id="map"></div>
+
+  <div class="controls">
+    <button id="btn-electricity" class="btn-elec" onclick="reportOutage('electricity')">⚡ Power</button>
+    <button id="btn-water" class="btn-water" onclick="reportOutage('water')">💧 Water</button>
+    <button id="btn-wifi" class="btn-wifi" onclick="reportOutage('wifi')">📶 Wi-Fi</button>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <script>
+    const SUPABASE_URL = 'https://zzgsfijocyxkmlqqsuap.supabase.co';
+    const SUPABASE_KEY = 'sb_publishable_kPfkFs5vg2ixQ0w_-zBbAA_4lziFk6q';
+    const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    // Initialize Telegram WebApp
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+    }
+
+    const tgUser = tg?.initDataUnsafe?.user;
+    const telegramUserId = tgUser?.id || null;
+
+    function showBanner(msg) {
+      const el = document.getElementById('tgWarning');
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+
+    if (!telegramUserId) {
+      showBanner("Open this app inside Telegram to report outages (1 report per category every 12h).");
+      ['electricity', 'water', 'wifi'].forEach(t => {
+        document.getElementById(`btn-${t}`).disabled = true;
+      });
+    }
+
+    // Default center (Addis Ababa) until GPS locks on
+    const map = L.map('map').setView([9.0054, 38.7636], 13);
+
+    const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: '© Esri'
+    });
+
+    L.control.layers({ "Street Map": streetLayer, "Satellite": satelliteLayer }).addTo(map);
+
+    let userCoords = null;
+    let heatLayer = null;
+
+    // 1. Get User GPS Location
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          userCoords = [pos.coords.latitude, pos.coords.longitude];
+          map.setView(userCoords, 15);
+          L.circleMarker(userCoords, { radius: 7, color: '#10b981', fillOpacity: 1 })
+            .addTo(map).bindPopup("You are here");
+        },
+        () => showBanner("Please allow Location/GPS access in Telegram so we can pin your outage."),
+        { enableHighAccuracy: true }
+      );
+    }
+
+    // 2. Check which categories this Telegram user already reported in the last 12h
+    async function syncUserCooldowns() {
+      if (!telegramUserId) return;
+      const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+
+      const { data, error } = await db
+        .from('outages')
+        .select('type')
+        .eq('telegram_user_id', telegramUserId)
+        .gte('created_at', twelveHoursAgo);
+
+      if (error) return console.error("Cooldown sync error:", error);
+
+      const reportedTypes = new Set(data.map(r => r.type));
+      const labels = { electricity: '⚡ Power', water: '💧 Water', wifi: '📶 Wi-Fi' };
+
+      ['electricity', 'water', 'wifi'].forEach(type => {
+        const btn = document.getElementById(`btn-${type}`);
+        if (reportedTypes.has(type)) {
+          btn.disabled = true;
+          btn.textContent = `✓ ${labels[type].split(' ')[1]}`;
+        } else {
+          btn.disabled = false;
+          btn.textContent = labels[type];
+        }
+      });
+    }
+
+    // 3. Fetch last 24 hours of reports and draw heatmap
+    async function loadOutages() {
+      const filter = document.getElementById('filterType').value;
+      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+      let query = db.from('outages').select('lat, lng, type').gte('created_at', yesterday);
+      if (filter !== 'all') query = query.eq('type', filter);
+
+      const { data, error } = await query;
+      if (error) return console.error("Load error:", error);
+
+      if (heatLayer) map.removeLayer(heatLayer);
+      const points = data.map(row => [row.lat, row.lng, 0.8]);
+      heatLayer = L.heatLayer(points, { radius: 28, blur: 20, maxZoom: 17 }).addTo(map);
+    }
+
+    // 4. Submit a new outage (enforced by PostgreSQL trigger)
+    async function reportOutage(type) {
+      if (!telegramUserId) {
+        return showBanner("Please open this Mini App inside Telegram first.");
+      }
+      if (!userCoords) {
+        return showBanner("Still getting your GPS coordinates—wait 2 seconds and tap again.");
+      }
+
+      const btn = document.getElementById(`btn-${type}`);
+      btn.disabled = true;
+
+      const { error } = await db.from('outages').insert([
+        {
+          telegram_user_id: telegramUserId,
+          type: type,
+          lat: userCoords[0],
+          lng: userCoords[1]
+        }
+      ]);
+
+      if (error) {
+        console.error("Insert error:", error);
+        const msg = error.message.includes('COOLDOWN_ACTIVE')
+          ? `You already reported ${type} in the last 12 hours.`
+          : `Failed: ${error.message}`;
+        if (tg?.showAlert) tg.showAlert(msg); else alert(msg);
+        await syncUserCooldowns();
+      } else {
+        if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+        if (tg?.showAlert) tg.showAlert(`${type.toUpperCase()} outage reported!`);
+        await syncUserCooldowns();
+        await loadOutages();
+      }
+    }
+
+    loadOutages();
+    syncUserCooldowns();
+  </script>
+</body>
+</html>
